@@ -19,6 +19,7 @@ jobs:
       - name: ShellCheck
         run: |
           brew install shellcheck
+          shellcheck --version
           shellcheck -s sh scripts/stay-awake.sh tests/run-tests.sh tests/integration.sh
       - name: Unit tests (fake Claude processes, no API usage)
         run: sh tests/run-tests.sh
@@ -28,4 +29,8 @@ jobs:
           CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1"
         run: |
           npm install -g @anthropic-ai/claude-code
+          claude --version
+          # With both manifests present, "." resolves to the marketplace manifest,
+          # so validate the plugin manifest explicitly as well.
           claude plugin validate . --strict
+          claude plugin validate .claude-plugin/plugin.json --strict

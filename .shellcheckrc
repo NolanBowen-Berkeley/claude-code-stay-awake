@@ -1,4 +1,9 @@
-# Functions are dispatched indirectly via "$CMD", which ShellCheck reports as unreachable.
+# Functions are dispatched indirectly via "$CMD" (see the dispatch block at the
+# bottom of scripts/stay-awake.sh). ShellCheck cannot see those calls and
+# reports the functions as unreachable / never invoked:
+#   SC2317  (ShellCheck <= 0.10)
+#   SC2329  (ShellCheck >= 0.11, which split "never invoked" out of SC2317)
 disable=SC2317
+disable=SC2329
 # Tests use `check && ok || bad`; `ok` cannot fail, so the idiom is safe here.
 disable=SC2015
