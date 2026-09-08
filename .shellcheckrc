@@ -1,0 +1,4 @@
+# Functions are dispatched indirectly via "$CMD", which ShellCheck reports as unreachable.
+disable=SC2317
+# Tests use `check && ok || bad`; `ok` cannot fail, so the idiom is safe here.
+disable=SC2015

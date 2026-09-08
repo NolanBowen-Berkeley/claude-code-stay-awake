@@ -1,0 +1,31 @@
+name: tests
+on:
+  push:
+    branches: [main]
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: macos-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+      - name: Syntax check
+        run: |
+          for f in scripts/stay-awake.sh tests/run-tests.sh tests/integration.sh; do
+            sh -n "$f" || exit 1
+          done
+      - name: ShellCheck
+        run: |
+          brew install shellcheck
+          shellcheck -s sh scripts/stay-awake.sh tests/run-tests.sh tests/integration.sh
+      - name: Unit tests (fake Claude processes, no API usage)
+        run: sh tests/run-tests.sh
+      - name: Validate plugin and marketplace manifests
+        env:
+          DISABLE_AUTOUPDATER: "1"
+          CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1"
+        run: |
+          npm install -g @anthropic-ai/claude-code
+          claude plugin validate . --strict
