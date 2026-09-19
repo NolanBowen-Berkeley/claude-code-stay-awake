@@ -16,8 +16,17 @@
 #               backgrounded are still running, a watchdog keeps the Mac awake
 #               until they finish (capped by STAY_AWAKE_BACKGROUND_MAX_HOURS).
 #   end      -> SessionEnd: release everything.
+#   start    -> SessionStart: restore lid sleep a crashed session left disabled.
 #
-# Rules for hook mode (acquire/waiting/release/end):
+# Closed-lid mode (STAY_AWAKE_LID=1): `caffeinate` cannot stop a MacBook from
+# sleeping when the lid is closed. The only switch that can is the system-wide
+# `pmset disablesleep`, which needs root. In this mode the hooks turn it on
+# while an assertion is held (main or background watchdog) and back off as soon
+# as Claude is idle, waiting for you, or gone, through a narrow passwordless
+# sudo rule installed once with /stay-awake:lid-setup. A "lidwatch" process
+# bound to the Claude pid restores it if Claude crashes.
+#
+# Rules for hook mode (acquire/waiting/release/end/start):
 #   * never write to stdout  (hook stdout can be injected into Claude's context)
 #   * never exit non-zero    (a failing hook is shown to the user as an error)
 #   * return fast            (hooks block Claude until they exit)
@@ -33,7 +42,8 @@
 #                                         ok); 0 = until released
 #   STAY_AWAKE_BACKGROUND=1            stay awake for Bash tasks Claude backgrounded
 #   STAY_AWAKE_BACKGROUND_MAX_HOURS=4  cap for that background watchdog
-#   STAY_AWAKE_DEBUG=1                 append a log to STAY_AWAKE_LOG
+#   STAY_AWAKE_LID=1                   closed-lid mode (see above; needs /stay-awake:lid-setup)
+#   STAY_AWAKE_DEBUG=1                append a log to STAY_AWAKE_LOG
 #   STAY_AWAKE_LOG=<path>              default: $TMPDIR/claude-stay-awake/stay-awake.log
 #   STAY_AWAKE_STATE_DIR=<dir>         where the per-session off marker (and default log)
 #                                      live; default $TMPDIR/claude-stay-awake
@@ -50,11 +60,17 @@ case "$(printf '%s' "${STAY_AWAKE_BACKGROUND:-1}" | tr '[:upper:]' '[:lower:]')"
   0|false|no|off) BG_ENABLED=0 ;;
   *)              BG_ENABLED=1 ;;
 esac
+case "$(printf '%s' "${STAY_AWAKE_LID:-0}" | tr '[:upper:]' '[:lower:]')" in
+  1|true|yes|on) LID_ENABLED=1 ;;
+  *)             LID_ENABLED=0 ;;
+esac
 STATE_DIR=${STAY_AWAKE_STATE_DIR:-"${TMPDIR:-/tmp}/claude-stay-awake"}
 LOG_FILE=${STAY_AWAKE_LOG:-"$STATE_DIR/stay-awake.log"}
 FALLBACK_SECS=7200      # only used when the Claude pid cannot be determined
 GUARD_MAX_SECS=86400    # backstop for the waiting-on-user poller
 POLL_SECS=3             # how often the guard looks for a running command
+LID_POLL_SECS=5         # how often the lid watcher checks that something is still held
+SUDOERS_FILE=/etc/sudoers.d/claude-stay-awake
 
 # Normalise the flag list once, so the string we start caffeinate with and the
 # one ps shows are identical (single spaces, no glob expansion).
@@ -175,6 +191,122 @@ drop_guard() {
   return 0
 }
 
+# ---- closed-lid mode -------------------------------------------------------
+# `pmset disablesleep` is system-wide, so one global marker is shared by all
+# sessions and lid sleep is only restored once no session holds an assertion.
+lid_mark()       { printf '%s/lid-disabled' "$STATE_DIR"; }
+sleep_disabled() { pmset -g 2>/dev/null | awk '$1 == "SleepDisabled" { print $2; exit }'; }
+lid_rule_ok()    { sudo -n -l /usr/bin/pmset -a disablesleep 1 >/dev/null 2>&1; }
+lidwatch_pids()  { pgrep -f -- "stay-awake\.sh lidwatch $1\$" 2>/dev/null; }
+# Any Stay Awake assertion held by any session (main or background watchdog).
+# This process, its parent and its children are ignored: a watchdog asks this
+# as it exits, and its own `caffeinate` wrapper can be either (caffeinate's
+# utility form execs the utility in the original process and keeps the
+# assertion in a child).
+any_held() {
+  ex="-e $$ -e $PPID"
+  for c in $(pgrep -P "$$" 2>/dev/null); do ex="$ex -e $c"; done
+  # shellcheck disable=SC2086  # $ex is a list of -e <pid> options
+  { pgrep -f -- '^caffeinate .*-w [0-9][0-9]*$' 2>/dev/null
+    pgrep -f -- 'stay-awake\.sh watchdog [0-9][0-9]*$' 2>/dev/null
+  } | grep -v -x $ex | grep -q .
+}
+start_lidwatch() {  # $1 = claude pid
+  /bin/sh "$SELF" lidwatch "$1" </dev/null >/dev/null 2>&1 &
+  log "lid: watcher pid=$! (claude=$1)"
+}
+lid_hold() {  # $1 = claude pid; disable lid sleep while an assertion is held
+  [ "$LID_ENABLED" = 1 ] && [ -n "${1:-}" ] || return 0
+  if [ -e "$(lid_mark)" ]; then
+    lidwatch_pids "$1" >/dev/null || start_lidwatch "$1"
+    return 0
+  fi
+  if [ "$(sleep_disabled)" = 1 ]; then log "lid: sleep already disabled system-wide; leaving it alone"; return 0; fi
+  if sudo -n /usr/bin/pmset -a disablesleep 1 >/dev/null 2>&1; then
+    mkdir -p "$STATE_DIR" 2>/dev/null; printf '%s\n' "$1" > "$(lid_mark)"
+    log "lid: lid sleep disabled (claude=$1)"
+    start_lidwatch "$1"
+  else
+    log "lid: cannot disable lid sleep; run /stay-awake:lid-setup once (claude=$1)"
+  fi
+  return 0
+}
+lid_release() {  # restore lid sleep if we disabled it and nothing is held any more
+  [ -e "$(lid_mark)" ] || return 0
+  if any_held; then log "lid: an assertion is still held; keeping lid sleep disabled"; return 0; fi
+  if sudo -n /usr/bin/pmset -a disablesleep 0 >/dev/null 2>&1; then
+    rm -f "$(lid_mark)"; log "lid: lid sleep restored"
+  else
+    log "lid: FAILED to restore lid sleep; run: sudo pmset -a disablesleep 0"
+  fi
+  for p in $(pgrep -f -- 'stay-awake\.sh lidwatch [0-9][0-9]*$' 2>/dev/null); do
+    [ "$p" = "$$" ] || kill "$p" 2>/dev/null
+  done
+  return 0
+}
+lidwatch() {  # restores lid sleep when Claude is gone, nothing is held, or a hook already restored it
+  cpid=$1; misses=0
+  while [ -e "$(lid_mark)" ] && kill -0 "$cpid" 2>/dev/null; do
+    if any_held; then misses=0; else misses=$((misses + 1)); [ "$misses" -lt 2 ] || break; fi
+    sleep "$LID_POLL_SECS"
+  done
+  log "lid: watcher exiting (claude=$cpid)"
+  lid_release
+}
+self_path() { printf '%s/%s' "$(cd "$(dirname "$SELF")" 2>/dev/null && pwd)" "$(basename "$SELF")"; }
+lid_setup() {
+  if [ "$(id -u)" != 0 ]; then
+    if lid_rule_ok; then rule="installed"; else rule="NOT installed"; fi
+    cat <<EOF
+Closed-lid mode keeps the Mac awake with the lid closed (no external display
+needed). caffeinate cannot do that; the only switch that can is the system-wide
+"pmset disablesleep", which needs root. Stay Awake turns it on only while Claude
+is working and back off as soon as Claude is idle, waiting for you, or gone.
+
+The hooks run without a terminal, so this needs a one-time sudo rule that allows
+exactly two commands without a password:
+    /usr/bin/pmset -a disablesleep 1
+    /usr/bin/pmset -a disablesleep 0
+
+  1. In Terminal, run:
+       sudo sh "$(self_path)" lid-setup
+  2. Add "STAY_AWAKE_LID": "1" to the "env" block of ~/.claude/settings.json.
+  3. Restart Claude Code (or run /reload-plugins).
+
+Current state: sudo rule $rule; STAY_AWAKE_LID=${STAY_AWAKE_LID:-unset}; pmset SleepDisabled=$(sleep_disabled).
+To undo:       sudo sh "$(self_path)" lid-remove
+Caution: a closed MacBook that stays awake gets warm. Do not put it in a bag
+while a long task runs, and expect the battery to drain as if it were open.
+EOF
+    return 0
+  fi
+  u=${SUDO_USER:-}
+  case "$u" in ''|root) echo "Run this with sudo from your normal user account: sudo sh \"$(self_path)\" lid-setup"; return 1 ;; esac
+  tmp=$(mktemp "${TMPDIR:-/tmp}/claude-stay-awake-sudoers.XXXXXX") || return 1
+  {
+    echo "# Installed by the Claude Code Stay Awake plugin (/stay-awake:lid-setup)."
+    echo "# Lets the plugin's hooks toggle lid sleep without a password. Remove with:"
+    echo "#   sudo sh \"$(self_path)\" lid-remove"
+    echo "$u ALL=(root) NOPASSWD: /usr/bin/pmset -a disablesleep 1, /usr/bin/pmset -a disablesleep 0"
+  } > "$tmp"
+  if ! visudo -cf "$tmp" >/dev/null; then echo "Generated sudoers rule failed validation; nothing installed."; rm -f "$tmp"; return 1; fi
+  install -m 0440 -o root -g wheel "$tmp" "$SUDOERS_FILE" || { rm -f "$tmp"; return 1; }
+  rm -f "$tmp"
+  echo "Installed $SUDOERS_FILE for user $u."
+  echo "Now add \"STAY_AWAKE_LID\": \"1\" to the \"env\" block of ~/.claude/settings.json and restart Claude Code."
+}
+lid_remove() {
+  if [ "$(id -u)" != 0 ]; then
+    echo "Run in Terminal:  sudo sh \"$(self_path)\" lid-remove"
+    echo "This deletes $SUDOERS_FILE and re-enables lid sleep (pmset -a disablesleep 0)."
+    return 0
+  fi
+  rm -f "$SUDOERS_FILE"
+  /usr/bin/pmset -a disablesleep 0
+  rm -f "$(lid_mark)" 2>/dev/null
+  echo "Removed $SUDOERS_FILE and re-enabled lid sleep. Unset STAY_AWAKE_LID in ~/.claude/settings.json."
+}
+
 # ---- actions ---------------------------------------------------------------
 
 acquire() {
@@ -182,10 +314,11 @@ acquire() {
   if ! enabled "$cpid"; then log "disabled; not acquiring (claude=$cpid)"; return 0; fi
   drop_guard "$cpid"
   if [ -n "$cpid" ]; then
-    if is_held "$cpid"; then log "already held (claude=$cpid)"; return 0; fi
+    if is_held "$cpid"; then log "already held (claude=$cpid)"; lid_hold "$cpid"; return 0; fi
     # shellcheck disable=SC2046  # word-splitting main_args into arguments is intended
     caffeinate $(main_args "$cpid") </dev/null >/dev/null 2>&1 &
     log "acquired: caffeinate pid=$! claude=$cpid args='$(main_args "$cpid")'"
+    lid_hold "$cpid"
   else
     if fallback_pids >/dev/null; then log "fallback already held"; return 0; fi
     # shellcheck disable=SC2086
@@ -197,6 +330,7 @@ acquire() {
 waiting() {  # Claude is blocked on the user; let the Mac sleep, but watch for a command starting
   cpid=$(find_claude_pid) || cpid=
   drop_main "$cpid"
+  lid_release
   [ -n "$cpid" ] && enabled "$cpid" || return 0
   if guard_pids "$cpid" >/dev/null; then log "guard already running (claude=$cpid)"; return 0; fi
   /bin/sh "$SELF" guard "$cpid" </dev/null >/dev/null 2>&1 &
@@ -218,9 +352,11 @@ guard() {  # polls until a shell command is running again (re-acquire) or we are
 release() {
   cpid=$(find_claude_pid) || cpid=
   drop_main "$cpid"
-  [ -n "$cpid" ] || return 0
+  [ -n "$cpid" ] || { lid_release; return 0; }
   drop_guard "$cpid"
+  keep_lid=0
   if enabled "$cpid" && [ "$BG_ENABLED" = 1 ] && has_shell_tasks "$cpid"; then
+    keep_lid=1
     if watchdog_pids "$cpid" >/dev/null; then
       log "background watchdog already running (claude=$cpid)"
     else
@@ -230,6 +366,9 @@ release() {
       log "background tasks still running ($(shell_task_count "$cpid")); watchdog caffeinate pid=$! (claude=$cpid, max ${BG_MAX_SECS}s)"
     fi
   fi
+  # A watchdog started a moment ago may not have exec'd yet, so any_held()
+  # could miss it: keep lid sleep disabled whenever a watchdog is wanted.
+  [ "$keep_lid" = 1 ] || lid_release
 }
 
 watchdog() {  # runs under `caffeinate`; exits when the background tasks (or Claude) are gone
@@ -241,6 +380,7 @@ watchdog() {  # runs under `caffeinate`; exits when the background tasks (or Cla
     sleep 10; waited=$((waited + 10))
   done
   log "watchdog: exiting (claude=$cpid, waited ${waited}s)"
+  lid_release
 }
 
 end() {  # $1 = hook payload (SessionEnd carries "reason")
@@ -249,10 +389,12 @@ end() {  # $1 = hook payload (SessionEnd carries "reason")
   reason=$(printf '%s' "${1:-}" | sed -n 's/.*"reason" *: *"\([^"]*\)".*/\1/p' | head -1)
   if [ "$reason" = clear ]; then
     # /clear keeps the same Claude process: keep the user's off switch and let
-    # the background watchdog finish on its own.
+    # the background watchdog finish on its own (it restores lid sleep itself).
+    watchdog_pids "${cpid:-0}" >/dev/null || lid_release
     log "session cleared (claude=$cpid); keeping off switch"; return 0
   fi
   drop_watchdog "$cpid"
+  lid_release
   [ -n "$cpid" ] && rm -f "$(marker "$cpid")" 2>/dev/null
   log "session ended (reason=${reason:-?}, claude=$cpid)"
   return 0
@@ -278,7 +420,7 @@ off() {
   if [ -n "$cpid" ]; then
     mkdir -p "$STATE_DIR" 2>/dev/null && claude_start "$cpid" > "$(marker "$cpid")"
   fi
-  drop_main "$cpid"; drop_guard "$cpid"; drop_watchdog "$cpid"
+  drop_main "$cpid"; drop_guard "$cpid"; drop_watchdog "$cpid"; lid_release
   echo "Stay Awake is OFF for this session (Claude pid ${cpid:-unknown}). The Mac may sleep normally, even while Claude works. Run /stay-awake:on to re-enable; it comes back on when Claude Code restarts."
 }
 
@@ -310,6 +452,17 @@ status() {
   echo "  Guard (waiting on you): $gd"
   echo "  Background watchdog:   $wd"
   echo "  Background Bash tasks: $bg"
+  if [ "$LID_ENABLED" = 1 ]; then
+    if lid_rule_ok; then lid="on (sudo rule installed)"; else lid="on, but the sudo rule is missing: run /stay-awake:lid-setup"; fi
+  else
+    lid="off (set STAY_AWAKE_LID=1; see /stay-awake:lid-setup)"
+  fi
+  sd=$(sleep_disabled); sdby=""
+  [ -e "$(lid_mark)" ] && sdby=" (disabled by Stay Awake; restored when Claude is idle)"
+  lp=$(lidwatch_pids "${cpid:-0}" | tr '\n' ' '); if [ -n "$lp" ]; then lw="running (pid ${lp% })"; else lw="not running"; fi
+  echo "  Closed-lid mode:       $lid"
+  echo "  pmset SleepDisabled:   ${sd:-unknown}$sdby"
+  echo "  Lid watcher:           $lw"
   allpids=$(printf '%s %s' "$mp" "$wp" | tr ' ' '\n' | grep -E '^[0-9]+$' | paste -s -d '|' -)
   if [ -n "$allpids" ]; then
     echo "  pmset assertions owned by Stay Awake:"
@@ -319,13 +472,18 @@ status() {
   fi
   mh=${STAY_AWAKE_MAX_HOURS:-0}; valid_hours "$mh" || mh="$mh (invalid, using 0)"
   bh=${STAY_AWAKE_BACKGROUND_MAX_HOURS:-4}; valid_hours "$bh" || bh="$bh (invalid, using 4)"
-  echo "  Config: FLAGS='$FLAGS' MAX_HOURS=$mh BACKGROUND=$BG_ENABLED BACKGROUND_MAX_HOURS=$bh DEBUG=${STAY_AWAKE_DEBUG:-0}"
+  echo "  Config: FLAGS='$FLAGS' MAX_HOURS=$mh BACKGROUND=$BG_ENABLED BACKGROUND_MAX_HOURS=$bh LID=$LID_ENABLED DEBUG=${STAY_AWAKE_DEBUG:-0}"
+}
+
+start() {  # SessionStart: a crashed session may have left lid sleep disabled
+  if [ -e "$(lid_mark)" ] && [ "$(sleep_disabled)" != 1 ]; then rm -f "$(lid_mark)"; fi  # restored by hand
+  lid_release
 }
 
 # ---- dispatch --------------------------------------------------------------
 
 case "$CMD" in
-  acquire|waiting|release|end)
+  acquire|waiting|release|end|start)
     # Hook mode: read the JSON Claude Code sends on stdin, then go silent.
     INPUT=; [ -t 0 ] || INPUT=$(cat 2>/dev/null)
     exec </dev/null >/dev/null 2>&1
@@ -346,7 +504,7 @@ case "$CMD" in
     esac
     exit 0
     ;;
-  watchdog|guard)
+  watchdog|guard|lidwatch)
     exec </dev/null >/dev/null 2>&1
     [ -n "$PID_ARG" ] || exit 0
     "$CMD" "$PID_ARG"
@@ -359,8 +517,10 @@ case "$CMD" in
     "$CMD"
     exit 0
     ;;
+  lid-setup)  lid_setup ;;
+  lid-remove) lid_remove ;;
   *)
-    echo "usage: $(basename "$SELF") acquire|waiting|release|end|status|on|off" >&2
+    echo "usage: $(basename "$SELF") acquire|waiting|release|end|start|status|on|off|lid-setup|lid-remove" >&2
     exit 0
     ;;
 esac

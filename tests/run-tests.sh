@@ -6,7 +6,7 @@ set -u
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 S="$ROOT/scripts/stay-awake.sh"
 WORK=$(mktemp -d "${TMPDIR:-/tmp}/stay-awake-ut.XXXXXX")
-unset STAY_AWAKE_DISABLED STAY_AWAKE_FLAGS STAY_AWAKE_MAX_HOURS STAY_AWAKE_BACKGROUND STAY_AWAKE_BACKGROUND_MAX_HOURS
+unset STAY_AWAKE_DISABLED STAY_AWAKE_FLAGS STAY_AWAKE_MAX_HOURS STAY_AWAKE_BACKGROUND STAY_AWAKE_BACKGROUND_MAX_HOURS STAY_AWAKE_LID
 export STAY_AWAKE_STATE_DIR="$WORK/state" STAY_AWAKE_DEBUG=1 STAY_AWAKE_LOG="$WORK/log"
 pass=0; fail=0
 ok()  { pass=$((pass + 1)); echo "  PASS: $*"; }
@@ -30,6 +30,34 @@ hook()  { sub=$1; shift; printf '{"session_id":"t","hook_event_name":"Test"}' | 
 hookj() { sub=$1; json=$2; shift 2; printf '%s' "$json" | env CLAUDE_PID="$FAKE" "$@" sh "$S" "$sub"; }
 cmd()   { sub=$1; shift; env CLAUDE_PID="$FAKE" "$@" sh "$S" "$sub" </dev/null; }
 
+# Closed-lid mode needs root for `pmset disablesleep`; test it against a fake
+# `sudo` and `pmset` placed first on PATH, which keep the flag in $WORK/pm-state.
+FAKEBIN="$WORK/bin"; mkdir -p "$FAKEBIN"
+cat > "$FAKEBIN/pmset" <<EOF
+#!/bin/sh
+# fake pmset: answers "pmset -g" from a state file; everything else goes to the real one
+if [ "\${1:-}" = -g ] && [ -z "\${2:-}" ]; then printf ' SleepDisabled\t\t%s\n' "\$(cat '$WORK/pm-state' 2>/dev/null || echo 0)"; exit 0; fi
+exec /usr/bin/pmset "\$@"
+EOF
+cat > "$FAKEBIN/sudo" <<EOF
+#!/bin/sh
+# fake sudo: the plugin's rule is "installed" while $WORK/sudo-allowed exists
+[ -e '$WORK/sudo-allowed' ] || { echo 'sudo: a password is required' >&2; exit 1; }
+case "\$*" in
+  '-n -l /usr/bin/pmset -a disablesleep 1') exit 0 ;;
+  '-n /usr/bin/pmset -a disablesleep 0'|'-n /usr/bin/pmset -a disablesleep 1')
+    a=\$*; echo "\${a##* }" > '$WORK/pm-state'; echo "\$a" >> '$WORK/sudo-calls'; exit 0 ;;
+esac
+echo "fake sudo: unexpected command: \$*" >&2; exit 1
+EOF
+chmod +x "$FAKEBIN/pmset" "$FAKEBIN/sudo"
+lhook()  { sub=$1; shift; hook "$sub" STAY_AWAKE_LID=1 PATH="$FAKEBIN:$PATH" "$@"; }
+lhookj() { sub=$1; json=$2; shift 2; hookj "$sub" "$json" STAY_AWAKE_LID=1 PATH="$FAKEBIN:$PATH" "$@"; }
+lcmd()   { sub=$1; shift; cmd "$sub" STAY_AWAKE_LID=1 PATH="$FAKEBIN:$PATH" "$@"; }
+pmstate()    { cat "$WORK/pm-state" 2>/dev/null || echo 0; }
+sudocalls()  { if [ -e "$WORK/sudo-calls" ]; then wc -l < "$WORK/sudo-calls" | tr -d ' '; else echo 0; fi; }
+lidwatches() { pgrep -f -- "stay-awake\.sh lidwatch $1\$" 2>/dev/null | wc -l | tr -d ' '; }
+
 # A controllable fake Claude: touching $WORK/spawn makes it start a child that
 # looks like a Claude Code tool shell (its args mention shell-snapshots/snapshot-).
 sh -c 'while :; do if [ -e "$1/spawn" ]; then rm -f "$1/spawn"; sh -c "sleep 296; sleep 0 # shell-snapshots/snapshot-unit-test" & fi; sleep 0.3; done' fakeclaude "$WORK" 2>/dev/null &
@@ -42,7 +70,7 @@ cleanup() {
   pkill -xf 'sleep 297' 2>/dev/null
   pkill -f -- "^caffeinate .*-w ($FAKE|${FAKE3:-0})\$" 2>/dev/null
   pkill -f -- '^caffeinate -i -s -t 7200$' 2>/dev/null
-  pkill -f -- "stay-awake\.sh (watchdog|guard) ($FAKE|${FAKE3:-0})\$" 2>/dev/null
+  pkill -f -- "stay-awake\.sh (watchdog|guard|lidwatch) ($FAKE|${FAKE3:-0})\$" 2>/dev/null
   rm -rf "$WORK"
 }
 trap cleanup EXIT INT TERM
@@ -172,12 +200,69 @@ hook release STAY_AWAKE_BACKGROUND=0; sleep 0.5
 assert_eq "$(watchdogs "$FAKE")" 0 "STAY_AWAKE_BACKGROUND=0 disables the watchdog"
 kill_tasks
 
+echo "== closed-lid mode (STAY_AWAKE_LID=1; fake sudo/pmset on PATH)"
+hook acquire; sleep 0.3
+assert_eq "$(pmstate)" 0 "without STAY_AWAKE_LID nothing touches lid sleep"
+hook release; sleep 0.3
+lhook acquire; sleep 0.3
+assert_eq "$(held "$FAKE")" 1 "acquire still holds the caffeinate assertion when the sudo rule is missing"
+assert_eq "$(pmstate)" 0 "...but does not disable lid sleep"
+grep -q 'run /stay-awake:lid-setup' "$WORK/log" && ok "log points at /stay-awake:lid-setup" || bad "no lid-setup hint in log"
+lcmd status | grep -q 'Closed-lid mode:  *on, but the sudo rule is missing' && ok "status reports the missing sudo rule" || bad "status lid line: $(lcmd status | grep 'Closed-lid')"
+lhook release; sleep 0.3
+touch "$WORK/sudo-allowed"
+lhook acquire; sleep 0.5
+assert_eq "$(pmstate)" 1 "acquire disables lid sleep (sudo pmset -a disablesleep 1)"
+[ -s "$WORK/state/lid-disabled" ] && ok "acquire writes the lid marker" || bad "lid marker missing"
+[ "$(lidwatches "$FAKE")" -ge 1 ] && ok "acquire starts a lid watcher" || bad "no lid watcher"
+lhook acquire; sleep 0.3
+assert_eq "$(sudocalls)" 1 "second acquire does not call sudo again"
+lcmd status | grep -q 'pmset SleepDisabled:  *1 (disabled by Stay Awake' && ok "status shows lid sleep disabled by Stay Awake" || bad "status: $(lcmd status | grep SleepDisabled)"
+lhook release; sleep 0.5
+assert_eq "$(pmstate)" 0 "release restores lid sleep"
+[ ! -e "$WORK/state/lid-disabled" ] && ok "release removes the lid marker" || bad "lid marker still present"
+wait_for 0 "lidwatches $FAKE" 4
+assert_eq "$(lidwatches "$FAKE")" 0 "release stops the lid watcher"
+lhook acquire; sleep 0.3; lhook waiting; sleep 0.5
+assert_eq "$(pmstate)" 0 "waiting on the user restores lid sleep"
+spawn_task; wait_for 1 "pmstate" 16
+assert_eq "$(pmstate)" 1 "guard re-acquire disables lid sleep again (~$((i / 2))s)"
+kill_tasks; lhook release; sleep 0.5
+assert_eq "$(pmstate)" 0 "release after the guard restores it"
+spawn_task; lhook acquire; sleep 0.3; lhook release; sleep 0.5
+assert_eq "$(pmstate)" 1 "background watchdog keeps lid sleep disabled"
+kill_tasks; wait_for 0 "pmstate" 30
+assert_eq "$(pmstate)" 0 "lid sleep restored when the watchdog exits (~$((i / 2))s)"
+lhook acquire; sleep 0.3; lhookj end '{"reason":"other"}'; sleep 0.5
+assert_eq "$(pmstate)" 0 "SessionEnd restores lid sleep"
+lhook acquire; sleep 0.3; lcmd off >/dev/null; sleep 0.5
+assert_eq "$(pmstate)" 0 "/stay-awake:off restores lid sleep"
+lcmd on >/dev/null; sleep 0.5
+assert_eq "$(pmstate)" 1 "/stay-awake:on disables it again"
+lhook release; sleep 0.5
+echo 1 > "$WORK/pm-state"; : > "$WORK/sudo-calls"
+lhook acquire; sleep 0.3
+[ ! -e "$WORK/state/lid-disabled" ] && ok "a SleepDisabled the user set is not claimed" || bad "marker written over a user setting"
+lhook release; sleep 0.3
+assert_eq "$(pmstate)" 1 "...and is left alone on release"
+assert_eq "$(sudocalls)" 0 "...without any sudo call"
+echo "$FAKE" > "$WORK/state/lid-disabled"
+lhook start; sleep 0.5
+assert_eq "$(pmstate)" 0 "SessionStart restores lid sleep a crashed session left disabled"
+[ ! -e "$WORK/state/lid-disabled" ] && ok "...and clears the stale marker" || bad "stale marker survived"
+out=$(lcmd lid-setup); echo "$out" | grep -q 'sudo sh ".*stay-awake.sh" lid-setup' && ok "lid-setup prints the sudo command to run" || bad "lid-setup output: $out"
+out=$(cmd status); echo "$out" | grep -q 'Closed-lid mode:  *off' && ok "status shows closed-lid mode off by default" || bad "status: $(echo "$out" | grep Closed-lid)"
+hook release; sleep 0.3
+
 echo "== -w: assertion dies with the Claude process"
 sleep 297 & FAKE3=$!
-printf '{}' | env CLAUDE_PID="$FAKE3" sh "$S" acquire; sleep 0.3
+printf '{}' | env CLAUDE_PID="$FAKE3" STAY_AWAKE_LID=1 PATH="$FAKEBIN:$PATH" sh "$S" acquire; sleep 0.5
 assert_eq "$(held "$FAKE3")" 1 "acquired for a second fake Claude"
+assert_eq "$(pmstate)" 1 "lid sleep disabled for it"
 kill "$FAKE3"; sleep 1.5
 assert_eq "$(held "$FAKE3")" 0 "caffeinate exited on its own when the Claude pid died"
+wait_for 0 "pmstate" 30
+assert_eq "$(pmstate)" 0 "lid watcher restored lid sleep after Claude died (~$((i / 2))s)"
 
 echo; echo "$pass passed, $fail failed"
 [ "$fail" -eq 0 ]

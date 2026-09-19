@@ -24,9 +24,11 @@ Claude Code fires hooks at each stage of a turn. The plugin's hooks call
 | `Notification: idle_prompt` (Claude has waited 60s for you) | Release (safety net for turns you interrupted, which fire no `Stop`) |
 | `SessionEnd` (`/exit`, window closed) | Release everything and forget `/stay-awake:off`. On `/clear` the off switch is kept |
 | Claude Code crashes or is killed | Nothing to do: `caffeinate -w` exits by itself the moment the Claude process is gone |
+| `SessionStart` | Only in closed-lid mode: re-enable lid sleep if a crashed session left it disabled |
 
 `-i` prevents idle system sleep. `-s` additionally prevents system sleep while on
 AC power. The display is still allowed to sleep by default (see configuration).
+Closing the lid is a separate mechanism; see [Closed-lid mode](#closed-lid-mode).
 
 ## Install
 
@@ -66,6 +68,43 @@ To update later: `/plugin update stay-awake@claude-code-stay-awake` (or
 | `/stay-awake:status` | Show the plugin state: which `caffeinate` holds the assertion, background tasks, watchdog, config, and the matching `pmset` lines. Because submitting the command is itself a prompt, the assertion is always held while it runs; to observe the idle state use the `pmset` snippet below from another terminal |
 | `/stay-awake:off` | Let the Mac sleep normally for the rest of this Claude Code session (survives `/clear`, reset when Claude Code exits) |
 | `/stay-awake:on` | Re-enable it |
+| `/stay-awake:lid-setup` | Print the one-time setup for [closed-lid mode](#closed-lid-mode) and its current state |
+
+## Closed-lid mode
+
+By default, closing a MacBook's lid still puts it to sleep: `caffeinate` cannot
+override the lid (only clamshell mode with power and an external display can).
+The one switch that can is the system-wide `pmset disablesleep`, which needs root.
+
+Closed-lid mode turns that switch on **only while Claude is working** (an
+assertion is held, or the background watchdog is following a backgrounded
+command) and back off the moment Claude is idle, waiting for you, or gone. So
+you can start a long task, close the lid, and the Mac stays awake until the
+task finishes, then sleeps as usual.
+
+Because hooks run without a terminal, it needs a one-time sudo rule allowing
+exactly two commands without a password:
+`/usr/bin/pmset -a disablesleep 1` and `/usr/bin/pmset -a disablesleep 0`.
+
+1. Run `/stay-awake:lid-setup` in Claude Code; it prints the exact command,
+   which is `sudo sh "<plugin dir>/scripts/stay-awake.sh" lid-setup`. Run that
+   in Terminal. It writes `/etc/sudoers.d/claude-stay-awake` for your user
+   after checking it with `visudo -c`.
+2. Add `"STAY_AWAKE_LID": "1"` to the `env` block of `~/.claude/settings.json`.
+3. Restart Claude Code (or `/reload-plugins`). `/stay-awake:status` now shows
+   `Closed-lid mode: on (sudo rule installed)`.
+
+Safety nets: a small watcher bound to the Claude pid re-enables lid sleep if
+Claude crashes; a `SessionStart` hook re-enables it if the watcher was lost too;
+`/stay-awake:status` shows the raw `pmset SleepDisabled` value; and if the
+plugin ever finds lid sleep already disabled by you, it leaves it alone. To
+undo everything: `sudo sh "<plugin dir>/scripts/stay-awake.sh" lid-remove`.
+Manual reset at any time: `sudo pmset -a disablesleep 0`.
+
+**Caution:** a closed MacBook that stays awake gets warm and drains the battery
+as if it were open. Do not put it in a bag while a task runs. The setting is
+system-wide while active, so with the lid closed the Mac will not sleep for any
+reason until Stay Awake restores it.
 
 ## Verify it yourself
 
@@ -97,6 +136,7 @@ Set environment variables in the `env` block of `~/.claude/settings.json`
 | `STAY_AWAKE_MAX_HOURS` | `0` | Hard cap (hours, decimals ok) on one acquire; `0` means "until released". |
 | `STAY_AWAKE_BACKGROUND` | `1` | Keep the Mac awake for Bash commands Claude backgrounded, after the turn ends. `0`, `false`, `no` or `off` disables it. |
 | `STAY_AWAKE_BACKGROUND_MAX_HOURS` | `4` | Cap for that background watchdog (so a dev server left running doesn't keep the Mac awake forever). `0` means no cap. |
+| `STAY_AWAKE_LID` | unset | Set `1` for [closed-lid mode](#closed-lid-mode) (needs the one-time `/stay-awake:lid-setup`). |
 | `STAY_AWAKE_DISABLED` | unset | Set `1` to make the plugin inert without uninstalling it. |
 | `STAY_AWAKE_DEBUG` | unset | Set `1` to append a log of every acquire/release. |
 | `STAY_AWAKE_LOG` | `$TMPDIR/claude-stay-awake/stay-awake.log` | Where that log goes. |
@@ -106,8 +146,10 @@ Invalid hour values (for example `2h`) fall back to the default; `/stay-awake:st
 
 ## Limitations
 
-- **Closing the lid** still sleeps a MacBook. `caffeinate` cannot override that
-  (unless the Mac is on power with an external display, i.e. clamshell mode).
+- **Closing the lid** still sleeps a MacBook unless you enable
+  [closed-lid mode](#closed-lid-mode), which needs a one-time sudo rule.
+  `caffeinate` alone cannot override the lid (except in clamshell mode: on
+  power with an external display).
 - `-s` only applies on AC power; on battery, `-i` still prevents idle sleep.
 - If you interrupt Claude mid-turn (Escape / Ctrl+C), Claude Code fires no
   `Stop` hook. The assertion is then released by the `idle_prompt` notification
@@ -149,7 +191,7 @@ appeared during the command and was gone afterwards. It also exercises the
 .claude-plugin/marketplace.json  lets this folder be added as a marketplace
 hooks/hooks.json                 which events call the script
 scripts/stay-awake.sh            all the logic (POSIX sh)
-commands/{status,on,off}.md      slash commands
+commands/{status,on,off,lid-setup}.md  slash commands
 tests/                           unit + integration tests
 ```
 

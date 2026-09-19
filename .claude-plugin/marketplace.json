@@ -7,14 +7,14 @@
   },
   "metadata": {
     "description": "Stay Awake: keeps macOS awake while Claude Code works.",
-    "version": "1.0.0"
+    "version": "1.1.0"
   },
   "plugins": [
     {
       "name": "stay-awake",
       "source": "./",
-      "description": "Keeps your Mac awake while Claude Code is working (tools, long commands, background tasks) and lets it sleep normally when Claude is idle or waiting for you.",
-      "version": "1.0.0",
+      "description": "Keeps your Mac awake while Claude Code is working (tools, long commands, background tasks, optionally with the lid closed) and lets it sleep normally when Claude is idle or waiting for you.",
+      "version": "1.1.0",
       "author": {
         "name": "Nolan Bowen",
         "url": "https://github.com/NolanBowen-Berkeley"

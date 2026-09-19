@@ -1,8 +1,8 @@
 {
   "$schema": "https://json.schemastore.org/claude-code-plugin-manifest.json",
   "name": "stay-awake",
-  "version": "1.0.0",
-  "description": "Keeps your Mac awake while Claude Code is working (tools, long commands, background tasks) and lets it sleep normally when Claude is idle or waiting for you.",
+  "version": "1.1.0",
+  "description": "Keeps your Mac awake while Claude Code is working (tools, long commands, background tasks, optionally with the lid closed) and lets it sleep normally when Claude is idle or waiting for you.",
   "author": {
     "name": "Nolan Bowen",
     "url": "https://github.com/NolanBowen-Berkeley"
