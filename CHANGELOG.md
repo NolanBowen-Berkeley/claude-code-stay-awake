@@ -2,6 +2,13 @@
 
 ## 1.1.0
 
+- Windows and WSL support: a hidden PowerShell keeper holding
+  `SetThreadExecutionState` replaces `caffeinate`, with the same
+  acquire/waiting/release/background-watchdog behaviour and slash commands.
+  Closed-lid mode is a documented manual power-plan setting there. Tested in CI
+  on `windows-latest`.
+- Chromebooks: documented as unsupported (Crostini cannot influence ChromeOS
+  power management).
 - Closed-lid mode (`STAY_AWAKE_LID=1`): keeps a MacBook awake with the lid
   closed by disabling lid sleep (`pmset disablesleep`) only while Claude is
   working, through a narrow passwordless sudo rule installed once with

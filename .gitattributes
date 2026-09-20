@@ -1,0 +1,6 @@
+# Shell scripts must keep LF line endings even on Windows checkouts
+# (Git for Windows defaults to autocrlf=true, and sh chokes on CR).
+*.sh  text eol=lf
+*.ps1 text eol=lf
+*.md  text eol=lf
+*.json text eol=lf

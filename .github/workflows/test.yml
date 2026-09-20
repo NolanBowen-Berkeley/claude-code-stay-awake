@@ -13,14 +13,14 @@ jobs:
       - uses: actions/checkout@v5
       - name: Syntax check
         run: |
-          for f in scripts/stay-awake.sh tests/run-tests.sh tests/integration.sh; do
+          for f in scripts/stay-awake.sh scripts/stay-awake-windows.sh tests/run-tests.sh tests/run-tests-windows.sh tests/integration.sh; do
             sh -n "$f" || exit 1
           done
       - name: ShellCheck
         run: |
           brew install shellcheck
           shellcheck --version
-          shellcheck -s sh scripts/stay-awake.sh tests/run-tests.sh tests/integration.sh
+          shellcheck -s sh scripts/stay-awake.sh scripts/stay-awake-windows.sh tests/run-tests.sh tests/run-tests-windows.sh tests/integration.sh
       - name: Unit tests (fake Claude processes, no API usage)
         run: sh tests/run-tests.sh
       - name: Validate plugin and marketplace manifests
@@ -34,3 +34,25 @@ jobs:
           # so validate the plugin manifest explicitly as well.
           claude plugin validate . --strict
           claude plugin validate .claude-plugin/plugin.json --strict
+  test-windows:
+    runs-on: windows-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v5
+      - name: Syntax check (Git Bash)
+        run: |
+          for f in scripts/stay-awake.sh scripts/stay-awake-windows.sh tests/run-tests-windows.sh; do
+            sh -n "$f" || exit 1
+          done
+      - name: PowerShell parse check
+        shell: pwsh
+        run: |
+          $tokens = $null; $errors = $null
+          $null = [System.Management.Automation.Language.Parser]::ParseFile("$PWD/scripts/stay-awake-keeper.ps1", [ref]$tokens, [ref]$errors)
+          if ($errors) { $errors | ForEach-Object { Write-Error $_.Message }; exit 1 }
+          "keeper.ps1 parses"
+      - name: Unit tests (Windows backend, fake Claude processes, no API usage)
+        run: sh tests/run-tests-windows.sh

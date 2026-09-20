@@ -6,8 +6,11 @@ A Claude Code plugin that keeps your Mac awake **while Claude is actually workin
 (running a tool, a long shell command, or a command it backgrounded) and lets the
 Mac sleep normally as soon as Claude is idle or waiting for you.
 
-It uses macOS's built-in `caffeinate`. No daemons, no dependencies, nothing to
-build. macOS only; on other platforms the plugin is inert.
+On macOS it uses the built-in `caffeinate`; on Windows (and WSL) a tiny hidden
+PowerShell process holding a power request. No daemons, no dependencies,
+nothing to build. See [Platforms](#platforms) for what works where (short
+version: macOS fully, Windows and WSL without closed-lid automation, Chromebooks
+not at all).
 
 ## How it works
 
@@ -106,6 +109,47 @@ as if it were open. Do not put it in a bag while a task runs. The setting is
 system-wide while active, so with the lid closed the Mac will not sleep for any
 reason until Stay Awake restores it.
 
+## Platforms
+
+| Platform | Keep awake while Claude works | Closed lid | Notes |
+| --- | --- | --- | --- |
+| macOS | yes (`caffeinate`) | yes, opt-in ([closed-lid mode](#closed-lid-mode)) | Fully tested (unit + integration tests) |
+| Windows 10/11 (Claude Code with Git for Windows) | yes (`SetThreadExecutionState` via a hidden PowerShell "keeper") | manual one-time power-plan setting | Hooks run through Git Bash, so the same `sh` scripts hand over to `scripts/stay-awake-windows.sh`. Tested in CI on `windows-latest` |
+| WSL (Claude Code inside WSL) | yes (same keeper, started through WSL interop) | manual, as above | The keeper is a Windows process; a small watcher inside WSL stops it if Claude dies |
+| Linux | no (inert) | no | Nothing to build on: sleep prevention is desktop-specific (`systemd-inhibit`) and laptops rarely run Claude Code unattended there. Contributions welcome |
+| Chromebook | **no** | **no** | See below |
+
+**Windows details.** The keeper is `scripts/stay-awake-keeper.ps1`, started
+hidden with the same acquire/waiting/release states as on macOS. On native
+Windows it also exits by itself when the Claude process is gone (like
+`caffeinate -w`); `/stay-awake:status` shows its pid and, from an elevated
+shell, `powercfg /requests` lists it under `SYSTEM`. `STAY_AWAKE_FLAGS`
+containing `-d` also keeps the display on; the other flags are macOS-only and
+ignored. Closing the lid is a Windows power-plan setting that needs an elevated
+shell each time it changes, so it is not automated. To keep a laptop awake with
+the lid closed, run once in an elevated PowerShell (this is permanent until you
+undo it, so a closed laptop in a bag will run hot):
+
+```powershell
+powercfg /setacvalueindex SCHEME_CURRENT SUB_BUTTONS LIDACTION 0
+powercfg /setdcvalueindex SCHEME_CURRENT SUB_BUTTONS LIDACTION 0
+powercfg /setactive SCHEME_CURRENT
+```
+
+`LIDACTION 1` restores "sleep". With that set, Stay Awake keeps the PC awake
+while Claude works whether the lid is open or closed, and lets it idle to sleep
+normally afterwards.
+
+**Chromebooks.** Claude Code is not supported on ChromeOS itself; it can only
+run inside the Linux container (Crostini), and nothing inside that container is
+allowed to influence the Chromebook's power management. There is no supported
+way to prevent idle sleep from Crostini, and closing the lid always suspends a
+Chromebook unless an enterprise policy (`LidCloseAction`) says otherwise. So
+this plugin cannot work there. What does work: Google's own "Keep Awake"
+Chrome extension keeps the Chromebook awake with the lid open while you have it
+enabled (manual, not tied to Claude), and on a managed device an admin can set
+the lid-close action.
+
 ## Verify it yourself
 
 While Claude is running a command, in another terminal:
@@ -172,7 +216,8 @@ Invalid hour values (for example `2h`) fall back to the default; `/stay-awake:st
 ## Tests
 
 ```sh
-sh tests/run-tests.sh                                  # unit tests, fake Claude processes, no API usage
+sh tests/run-tests.sh                                  # macOS unit tests, fake Claude processes, no API usage
+sh tests/run-tests-windows.sh                          # Windows unit tests (run from Git Bash on Windows)
 CLAUDE_BIN=/path/to/claude sh tests/integration.sh     # real headless Claude sessions (a few cents; needs python3;
                                                        # CLAUDE_BIN defaults to `claude` on PATH)
 claude plugin validate . --strict                      # manifest / hooks validation
@@ -190,9 +235,11 @@ appeared during the command and was gone afterwards. It also exercises the
 .claude-plugin/plugin.json       plugin manifest
 .claude-plugin/marketplace.json  lets this folder be added as a marketplace
 hooks/hooks.json                 which events call the script
-scripts/stay-awake.sh            all the logic (POSIX sh)
+scripts/stay-awake.sh            all the macOS logic (POSIX sh); hands over to the Windows backend on Windows/WSL
+scripts/stay-awake-windows.sh    Windows/WSL backend (POSIX sh, runs under Git Bash or WSL)
+scripts/stay-awake-keeper.ps1    the Windows power-request holder
 commands/{status,on,off,lid-setup}.md  slash commands
-tests/                           unit + integration tests
+tests/                           unit tests (macOS and Windows) + macOS integration test
 ```
 
 ## Uninstall
@@ -204,4 +251,5 @@ tests/                           unit + integration tests
 
 (or the same with `claude plugin ...` from a terminal.)
 
-Any `caffeinate` bound to Claude with `-w` exits on its own when Claude Code exits.
+Any `caffeinate` bound to Claude with `-w` (or a Windows keeper watching the
+Claude pid) exits on its own when Claude Code exits.

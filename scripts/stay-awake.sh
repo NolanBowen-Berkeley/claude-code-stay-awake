@@ -56,6 +56,16 @@ set -u
 CMD=${1:-}
 PID_ARG=${2:-}   # watchdog/guard: the Claude pid (captured before `set --` below)
 SELF=$0
+
+# Windows (Git Bash) and WSL use the PowerShell-based backend instead of caffeinate.
+case "$(uname -s 2>/dev/null)" in
+  MINGW*|MSYS*|CYGWIN*) exec sh "$(dirname "$SELF")/stay-awake-windows.sh" "$CMD" "$PID_ARG" ;;
+  Linux)
+    if grep -qi microsoft /proc/version 2>/dev/null; then
+      exec sh "$(dirname "$SELF")/stay-awake-windows.sh" "$CMD" "$PID_ARG"
+    fi ;;
+esac
+
 case "$(printf '%s' "${STAY_AWAKE_BACKGROUND:-1}" | tr '[:upper:]' '[:lower:]')" in
   0|false|no|off) BG_ENABLED=0 ;;
   *)              BG_ENABLED=1 ;;
